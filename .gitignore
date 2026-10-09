@@ -1,0 +1,15 @@
+# Secrets
+.env
+
+# Données médicales : jamais sur GitHub
+data/*.csv
+exports/*
+!exports/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+!data/.gitkeep

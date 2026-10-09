@@ -1,0 +1,375 @@
+# Migration de données médicales vers MongoDB (Docker)
+
+Projet DataSoluTech : migration d'un dataset de 55 500 hospitalisations (CSV) vers
+**MongoDB 8.0**, conteneurisé avec **Docker Compose**, avec contrôles d'intégrité
+automatisés avant et après migration.
+
+---
+
+## Sommaire
+
+1. [Concepts clés de MongoDB](#1-concepts-clés-de-mongodb)
+2. [Architecture du projet](#2-architecture-du-projet)
+3. [Installation et lancement](#3-installation-et-lancement)
+4. [Logique de la migration](#4-logique-de-la-migration)
+5. [Schéma de la base de données](#5-schéma-de-la-base-de-données)
+6. [Authentification et rôles](#6-authentification-et-rôles)
+7. [Tests d'intégrité et tests automatisés](#7-tests-dintégrité-et-tests-automatisés)
+8. [CRUD, import et export](#8-crud-import-et-export)
+9. [Journal de bord](#9-journal-de-bord)
+
+---
+
+## 1. Concepts clés de MongoDB
+
+MongoDB est une base **NoSQL orientée documents**. Elle stocke les données sous forme
+de documents BSON (du JSON binaire typé) au lieu de lignes dans des tables.
+
+| Concept | Définition | Équivalent SQL | Dans ce projet |
+|---|---|---|---|
+| **Document** | Un enregistrement : un ensemble de paires clé/valeur, pouvant contenir des sous-documents et des tableaux. Chaque document a un identifiant unique `_id`. | Ligne | Une hospitalisation |
+| **Collection** | Un groupe de documents. Le schéma est flexible par défaut, mais on peut imposer une validation. | Table | `admissions` |
+| **Base de données** | Un conteneur de collections, avec ses propres utilisateurs et droits. | Base | `healthcare` |
+
+Exemple de document issu du dataset :
+
+```json
+{
+  "_id": ObjectId("..."),
+  "patient":   { "name": "Bobby Jackson", "age": 30, "gender": "Male", "blood_type": "B-" },
+  "admission": { "type": "Urgent", "admission_date": ISODate("2024-01-31"),
+                 "discharge_date": ISODate("2024-02-02"), "room_number": 328,
+                 "hospital": "Sons and Miller", "doctor": "Matthew Smith" },
+  "medical":   { "condition": "Cancer", "medication": "Paracetamol", "test_results": "Normal" },
+  "billing":   { "amount": 18856.28, "insurance_provider": "Blue Cross" }
+}
+```
+
+**Pourquoi MongoDB pour ce client ?**
+
+- **Scalabilité horizontale native.** Le *sharding* répartit les données sur plusieurs serveurs, et la *réplication* assure la haute disponibilité.
+- **Modèle document.** Un séjour se lit en une seule requête, sans jointure.
+- **Schéma flexible mais contrôlable.** De nouveaux champs médicaux peuvent être ajoutés sans migration de schéma, tout en gardant une validation des types.
+
+---
+
+## 2. Architecture du projet
+
+```
+projet5/
+├── docker-compose.yml        # Orchestration : MongoDB + script de migration
+├── .env.example              # Modèle des variables (le vrai .env n'est pas versionné)
+├── .gitignore
+├── mongo-init/
+│   └── 01-create-users.js    # Création des utilisateurs et rôles (1er démarrage)
+├── data/                     # Déposer ici healthcare_dataset.csv (non versionné)
+├── exports/                  # Rapport de migration et exports (non versionné)
+├── docs/
+│   └── JOURNAL.md            # Journal de bord
+└── migration/
+    ├── Dockerfile
+    ├── requirements.txt
+    ├── pytest.ini
+    ├── src/
+    │   ├── config.py         # Configuration lue depuis l'environnement
+    │   ├── cleaning.py       # Chargement, nettoyage, transformation en documents
+    │   ├── schema.py         # Validateur $jsonSchema et index
+    │   ├── integrity.py      # Contrôles avant / après migration
+    │   ├── migrate.py        # Script principal
+    │   ├── crud_demo.py      # Démonstration CRUD
+    │   └── export_data.py    # Export JSON + CSV
+    └── tests/                # Tests automatisés (pytest)
+```
+
+```mermaid
+flowchart LR
+    CSV[(healthcare_dataset.csv)] -->|volume lecture seule| MIG[Conteneur migration<br/>Python 3.12]
+    MIG -->|migration_user<br/>readWrite| DB[(Conteneur mongodb<br/>MongoDB 8.0)]
+    DB --- VOL[(Volume mongo_data)]
+    MIG -->|rapport JSON| EXP[exports/]
+```
+
+> **Données sensibles :** le CSV (données de santé) et le fichier `.env` sont exclus du
+> dépôt par le `.gitignore`.
+
+---
+
+## 3. Installation et lancement
+
+### Prérequis
+- Docker Desktop (Windows ou Mac) ou Docker Engine avec le plugin Compose (Linux)
+- Python 3.12, uniquement pour lancer les scripts hors Docker
+
+### Lancement avec Docker (recommandé)
+
+```bash
+# 1. Configurer les secrets
+cp .env.example .env               # puis éditer les mots de passe
+
+# 2. Déposer le dataset
+#    data/healthcare_dataset.csv
+
+# 3. Démarrer MongoDB et lancer la migration
+docker compose up -d --build
+
+# 4. Suivre la migration
+docker compose logs -f migration
+```
+
+Le conteneur `migration` attend que MongoDB soit prêt (`healthcheck`), exécute la
+migration puis s'arrête. Pour la relancer :
+
+```bash
+docker compose run --rm migration
+```
+
+> **Changer un mot de passe ou le script `mongo-init`.** Ils ne sont pris en compte qu'à
+> l'initialisation d'un volume vide. Il faut donc lancer `docker compose down -v` (ce qui
+> efface les données), puis `docker compose up -d`.
+
+### Lancement hors Docker (environnement virtuel)
+
+MongoDB doit tourner (`docker compose up -d mongodb`).
+
+```bash
+cd migration
+python -m venv .venv
+.venv\Scripts\activate             # Windows  (Linux/Mac : source .venv/bin/activate)
+pip install -r requirements.txt
+python -m src.migrate
+```
+
+Les variables sont lues dans le fichier `.env` à la racine du projet.
+
+---
+
+## 4. Logique de la migration
+
+Le script `src/migrate.py` enchaîne les étapes suivantes :
+
+| # | Étape | Détail |
+|---|---|---|
+| 1 | **Chargement** | Lecture du CSV et vérification des 15 colonnes attendues |
+| 2 | **Contrôle AVANT** | Profil des données brutes : types, valeurs manquantes, doublons, dates incohérentes, montants négatifs |
+| 3 | **Nettoyage** | Voir le tableau ci-dessous |
+| 4 | **Transformation** | Chaque ligne devient un document imbriqué (`patient`, `admission`, `medical`, `billing`) avec des types Python explicites |
+| 5 | **Préparation** | Suppression puis recréation de la collection avec un **validateur `$jsonSchema`**. La migration est donc **idempotente** : la relancer ne crée pas de doublons |
+| 6 | **Insertion par lots** | `insert_many` par lots de 5 000 documents (taille réglable avec `BATCH_SIZE`) |
+| 7 | **Index** | Création des 5 index (voir section 5) |
+| 8 | **Contrôle APRÈS** | Comparaison base / source. En cas d'écart, le script s'arrête avec le code 2 |
+| 9 | **Rapport** | `exports/migration_report.json` |
+
+### Problèmes détectés dans le dataset et traitement
+
+| Problème | Volume | Traitement |
+|---|---|---|
+| Doublons exacts | 534 lignes | Supprimés |
+| Doublons identiques sauf l'âge | 4 966 lignes supplémentaires | Supprimés (1ʳᵉ occurrence conservée) |
+| Casse aléatoire des noms (`bOBby JacksOn`) | Toutes les lignes | Normalisée (`Bobby Jackson`) |
+| Noms d'hôpitaux mal formés (`and Garcia Morris,`) | 14 619 lignes | Virgule finale et « and » orphelin supprimés |
+| Dates au format texte | 2 colonnes | Converties en type `Date` BSON |
+| Montants à 16 décimales | Toutes les lignes | Arrondis à 2 décimales |
+| Montants négatifs | 108 lignes (96 après dédoublonnage) | **Conservés** (remboursements possibles) et comptés dans le rapport |
+| Valeurs manquantes | 0 | — |
+
+**Résultat : 55 500 lignes → 50 000 documents.** Le chiffre rond confirme que les
+5 500 lignes retirées (10 %) étaient des copies artificielles. Ce sont aussi exactement
+50 000 montants de facturation distincts.
+
+> Le dataset n'a **pas d'identifiant patient**, et les noms ne sont pas uniques. Une
+> collection `patients` séparée ne pourrait donc pas être reliée de façon fiable aux
+> séjours.
+
+---
+
+## 5. Schéma de la base de données
+
+**Base** `healthcare` · **Collection** `admissions` · 1 document = 1 hospitalisation
+
+```mermaid
+erDiagram
+    ADMISSIONS {
+        ObjectId _id
+    }
+    PATIENT {
+        string name
+        int age "0 à 120"
+        string gender "Male | Female"
+        string blood_type "A+ ... O-"
+    }
+    ADMISSION {
+        string type "Emergency | Elective | Urgent"
+        date admission_date
+        date discharge_date
+        int room_number
+        string hospital
+        string doctor
+    }
+    MEDICAL {
+        string condition
+        string medication
+        string test_results "Normal | Abnormal | Inconclusive"
+    }
+    BILLING {
+        double amount
+        string insurance_provider
+    }
+    ADMISSIONS ||--|| PATIENT : "contient"
+    ADMISSIONS ||--|| ADMISSION : "contient"
+    ADMISSIONS ||--|| MEDICAL : "contient"
+    ADMISSIONS ||--|| BILLING : "contient"
+```
+
+### Correspondance CSV → MongoDB
+
+| Colonne CSV | Champ MongoDB | Type BSON |
+|---|---|---|
+| Name | `patient.name` | string |
+| Age | `patient.age` | int |
+| Gender | `patient.gender` | string (enum) |
+| Blood Type | `patient.blood_type` | string (enum) |
+| Admission Type | `admission.type` | string (enum) |
+| Date of Admission | `admission.admission_date` | date |
+| Discharge Date | `admission.discharge_date` | date |
+| Room Number | `admission.room_number` | int |
+| Hospital | `admission.hospital` | string |
+| Doctor | `admission.doctor` | string |
+| Medical Condition | `medical.condition` | string |
+| Medication | `medical.medication` | string |
+| Test Results | `medical.test_results` | string (enum) |
+| Billing Amount | `billing.amount` | double |
+| Insurance Provider | `billing.insurance_provider` | string |
+
+### Choix de modélisation
+
+- **Sous-documents imbriqués plutôt que collections séparées.** Les données d'un séjour sont toujours lues ensemble : pas de jointure (`$lookup`), une seule lecture disque.
+- **Regroupement par thème** (`patient`, `admission`, `medical`, `billing`). Les documents restent lisibles, et un sous-ensemble est facile à projeter (par exemple les champs `billing` seuls pour la comptabilité).
+- **Validation côté serveur (`$jsonSchema`, `validationLevel: strict`).** MongoDB **refuse** tout document dont un champ manque ou a un mauvais type, même s'il est inséré par un autre outil que ce script.
+
+### Index
+
+| Index | Champs | Requête servie |
+|---|---|---|
+| `idx_patient_name` | `patient.name` | Retrouver les séjours d'un patient |
+| `idx_condition_date` | `medical.condition` + `admission.admission_date` | Statistiques par pathologie sur une période |
+| `idx_admission_date` | `admission.admission_date` | Activité par période |
+| `idx_hospital` | `admission.hospital` | Activité par établissement |
+| `idx_insurance` | `billing.insurance_provider` | Facturation par assureur |
+
+L'index composé `condition + date` sert aussi les requêtes sur la pathologie seule
+(règle du préfixe). Aucun index séparé n'est donc créé sur `medical.condition`.
+
+---
+
+## 6. Authentification et rôles
+
+L'authentification est activée par `MONGO_INITDB_ROOT_USERNAME/PASSWORD`. Elle utilise
+**SCRAM-SHA-256** : le mot de passe n'est jamais transmis en clair, et il est stocké
+haché avec un sel.
+
+Les utilisateurs applicatifs sont créés au premier démarrage par
+`mongo-init/01-create-users.js`. Leurs mots de passe viennent des variables
+d'environnement, donc aucun secret n'est présent dans le code.
+
+| Utilisateur | Base d'authentification | Rôle(s) | Usage | Lire | Écrire | Gérer index / utilisateurs |
+|---|---|---|---|:-:|:-:|:-:|
+| `admin` | admin | `root` | Administration du serveur | ✅ | ✅ | ✅ |
+| `migration_user` | healthcare | `readWrite` | Script de migration | ✅ | ✅ | index uniquement |
+| `analyst_user` | healthcare | `read` | Analystes, reporting | ✅ | ❌ | ❌ |
+| `healthcare_admin` | healthcare | `dbAdmin`, `userAdmin` | Responsable de la base | ❌ | ❌ | ✅ |
+
+> `userAdmin` permet de gérer les utilisateurs de la base, y compris de s'attribuer des
+> droits. Ce compte doit donc être réservé à une personne de confiance.
+
+**Principe du moindre privilège** : chaque compte n'a que les droits nécessaires. Le script
+de migration ne se connecte **jamais en root**. Un analyste qui tente d'écrire reçoit
+une erreur :
+
+```
+MongoServerError[Unauthorized]: not authorized on healthcare to execute command { insert: "test", ... }
+```
+
+Se connecter avec un compte :
+
+```bash
+docker exec -it mongodb mongosh -u analyst_user -p --authenticationDatabase healthcare healthcare
+```
+
+---
+
+## 7. Tests d'intégrité et tests automatisés
+
+### Contrôles intégrés au script (à chaque migration)
+
+| Contrôle | Avant | Après |
+|---|:-:|:-:|
+| Colonnes attendues présentes | ✅ | — |
+| Types des colonnes | ✅ | ✅ (type BSON de chacun des 15 champs) |
+| Valeurs manquantes / champs absents | ✅ | ✅ |
+| Doublons | ✅ | ✅ (agrégation `$group`) |
+| Cohérence des dates (sortie ≥ admission) | ✅ | — |
+| Nombre de lignes = nombre de documents | — | ✅ |
+| Valeurs catégorielles identiques à la source | — | ✅ |
+| Somme des montants identique à la source | — | ✅ |
+
+Les résultats sont écrits dans `exports/migration_report.json`.
+
+### Tests automatisés (pytest)
+
+```bash
+# Dans Docker
+docker compose run --rm migration pytest -v
+
+# Hors Docker
+cd migration && pytest -v
+```
+
+| Fichier | Contenu | Serveur requis |
+|---|---|---|
+| `test_cleaning.py` | Nettoyage, dédoublonnage, typage, structure des documents | Non |
+| `test_integrity.py` | Les contrôles détectent bien un document perdu, un mauvais type, un champ absent, un doublon | Non (mongomock) |
+| `test_migration.py` | Migration complète, idempotence, index, CRUD, export | Non (mongomock) |
+| `test_integration_mongo.py` | Migration réelle, et rejet par le validateur d'un mauvais type ou d'un champ manquant | **Oui** (ignoré sinon) |
+
+Les tests utilisent un petit CSV de 5 lignes contenant volontairement des anomalies, et
+une collection dédiée (`admissions_test`). Les données migrées ne sont pas touchées.
+
+---
+
+## 8. CRUD, import et export
+
+### Démonstration CRUD (Python)
+
+```bash
+docker compose run --rm migration python -m src.crud_demo
+```
+
+Le script crée un document de test, le lit, exécute des requêtes sur le dataset (séjours
+pour diabète depuis 2023, patients les plus âgés), le modifie, calcule le coût moyen par
+pathologie (agrégation), puis le supprime.
+
+### Import
+
+L'import complet correspond à la migration (`python -m src.migrate`).
+
+### Export
+
+```bash
+# Export JSON (types conservés) + CSV à plat
+docker compose run --rm migration python -m src.export_data
+# -> exports/admissions.json, exports/admissions.csv
+```
+
+Sauvegarde et restauration avec les outils MongoDB, inclus dans l'image officielle :
+
+```bash
+docker exec mongodb mongodump -u admin -p <mdp> --authenticationDatabase admin --db healthcare --archive=/data/db/backup.gz --gzip
+docker exec mongodb mongorestore -u admin -p <mdp> --authenticationDatabase admin --archive=/data/db/backup.gz --gzip --drop
+```
+
+---
+
+## 9. Journal de bord
+
+Les étapes, les difficultés rencontrées et les solutions apportées sont consignées dans
+[`docs/JOURNAL.md`](docs/JOURNAL.md).
