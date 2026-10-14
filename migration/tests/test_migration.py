@@ -1,6 +1,6 @@
 """Migration complète sur le vrai serveur MongoDB (conteneur Docker).
 
-Les tests travaillent sur la collection `admissions_test`, recréée puis
+Les tests travaillent sur la collection `admissions_test`, recréée puis bien entendu
 supprimée à chaque test : les données migrées (`admissions`) ne sont pas
 touchées. Le validateur $jsonSchema est actif, comme en production.
 """
